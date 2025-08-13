@@ -5,6 +5,10 @@
 #include <math.h>
 #include <omp.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 
 // =======================
 // PARÁMETROS GENERALES
@@ -115,38 +119,130 @@ static void seccion_barra_fria(double t, RNG *rng, Cola *q_cold, Servidor *cold,
                                double *ventas_local, int *compl_local, double *espera_local);
 
 // =======================
-// STUBS (rellenan tus compas)
+// IMPLEMENTACIONES
 // =======================
 static void seccion_cajas(double t, RNG *rng, Cola *q_caja, Cola *q_hot, Cola *q_cold,
-                          Servidor *cajas, int n_caja, double *espera_local){
-    /*
-      COMPAÑERO A:
-        1) Si un cajero está ocupado, restar DT a su t_restante. Si llega a 0, 
-           el cliente va a q_hot o q_cold según su tipo (y guardar c.t_fin_caja=t).
-        2) Si un cajero está libre y hay gente en q_caja, sacar a uno.
-           Sumar a espera_local: (t - c.t_llegada) y asignar t_restante=expo(MU_CAJA, rng).
-    */
-    (void)t; (void)rng; (void)q_caja; (void)q_hot; (void)q_cold; (void)cajas; (void)n_caja; (void)espera_local;
+                          Servidor *cajas, int n_caja, double *espera_local)
+{
+    double espera_add = 0.0;
+
+    for(int i=0; i<n_caja; ++i){
+        // Avanzar servicio si ocupado
+        if(cajas[i].ocupado){
+            cajas[i].t_restante -= DT;
+            if(cajas[i].t_restante <= 0.0){
+                // Pasa a barra correspondiente
+                Cliente c = cajas[i].c;
+                c.t_fin_caja = t;
+                if(es_fria(c.tipo)) (void)cola_enqueue(q_cold, c);
+                else                (void)cola_enqueue(q_hot,  c);
+
+                cajas[i].ocupado = false;
+                cajas[i].t_restante = 0.0;
+            }
+        }
+
+        // Si está libre, tomar de la cola de caja
+        if(!cajas[i].ocupado){
+            Cliente c;
+            if(cola_dequeue(q_caja, &c)){
+                espera_add += (t - c.t_llegada);
+                cajas[i].c = c;
+                cajas[i].t_restante = expo(MU_CAJA, rng);
+                cajas[i].ocupado = true;
+            }
+        }
+    }
+
+    // Acumular la espera de esta sección de forma segura
+    #pragma omp critical(accum_espera)
+    {
+        *espera_local += espera_add;
+    }
 }
 
 static void seccion_barra_caliente(double t, RNG *rng, Cola *q_hot, Servidor *hot, int n_hot,
-                                   double *ventas_local, int *compl_local, double *espera_local){
-    /*
-      COMPAÑERO B (calientes):
-        1) Avanzar baristas ocupados (restar DT). Si terminan:
-             ventas_local += PRECIOS[tipo]; (*compl_local)++; liberar barista.
-        2) Si hay alguien en q_hot y un barista libre, tomarlo:
-             espera_local += (t - c.t_fin_caja); t_restante = expo(MU_HOT[c.tipo], rng).
-    */
-    (void)t; (void)rng; (void)q_hot; (void)hot; (void)n_hot; (void)ventas_local; (void)compl_local; (void)espera_local;
+                                   double *ventas_local, int *compl_local, double *espera_local)
+{
+    double ventas_add = 0.0;
+    int    compl_add  = 0;
+    double espera_add = 0.0;
+
+    for(int j=0; j<n_hot; ++j){
+        // Avanzar si ocupado
+        if(hot[j].ocupado){
+            hot[j].t_restante -= DT;
+            if(hot[j].t_restante <= 0.0){
+                ventas_add += PRECIOS[ hot[j].c.tipo ];
+                compl_add  += 1;
+                hot[j].ocupado = false;
+                hot[j].t_restante = 0.0;
+            }
+        }
+
+        // Si libre, tomar de la cola caliente
+        if(!hot[j].ocupado){
+            Cliente c;
+            if(cola_dequeue(q_hot, &c)){
+                espera_add += (t - c.t_fin_caja);
+                double mu = MU_HOT[c.tipo];
+                if(mu <= 0.0) mu = 1.0; // fallback de seguridad
+                hot[j].c = c;
+                hot[j].t_restante = expo(mu, rng);
+                hot[j].ocupado = true;
+            }
+        }
+    }
+
+    // Acumular de forma segura
+    #pragma omp critical(accum_hot)
+    {
+        *ventas_local += ventas_add;
+        *compl_local  += compl_add;
+        *espera_local += espera_add;
+    }
 }
 
 static void seccion_barra_fria(double t, RNG *rng, Cola *q_cold, Servidor *cold, int n_cold,
-                               double *ventas_local, int *compl_local, double *espera_local){
-    /*
-      COMPAÑERO C (frías): igual que el caliente, pero usando MU_COLD.
-    */
-    (void)t; (void)rng; (void)q_cold; (void)cold; (void)n_cold; (void)ventas_local; (void)compl_local; (void)espera_local;
+                               double *ventas_local, int *compl_local, double *espera_local)
+{
+    double ventas_add = 0.0;
+    int    compl_add  = 0;
+    double espera_add = 0.0;
+
+    for(int k=0; k<n_cold; ++k){
+        // Avanzar si ocupado
+        if(cold[k].ocupado){
+            cold[k].t_restante -= DT;
+            if(cold[k].t_restante <= 0.0){
+                ventas_add += PRECIOS[ cold[k].c.tipo ];
+                compl_add  += 1;
+                cold[k].ocupado = false;
+                cold[k].t_restante = 0.0;
+            }
+        }
+
+        // Si libre, tomar de la cola fría
+        if(!cold[k].ocupado){
+            Cliente c;
+            if(cola_dequeue(q_cold, &c)){
+                espera_add += (t - c.t_fin_caja);
+                double mu = MU_COLD[c.tipo];
+                if(mu <= 0.0) mu = 1.0; // fallback
+                cold[k].c = c;
+                cold[k].t_restante = expo(mu, rng);
+                cold[k].ocupado = true;
+            }
+        }
+    }
+
+    // Acumular de forma segura
+    #pragma omp critical(accum_cold)
+    {
+        *ventas_local += ventas_add;
+        *compl_local  += compl_add;
+        *espera_local += espera_add;
+    }
 }
 
 // =======================
@@ -192,15 +288,15 @@ int main(void){
                     while(cola_len(&q_cold) > UMBRAL_LEN){ Cliente dummy; cola_dequeue(&q_cold,&dummy); aband_local++; }
                 }
 
-                // 2) Cajas: TAREA del Compañero A
+                // 2) Cajas
                 #pragma omp section
                 { seccion_cajas(t, &rng, &q_caja, &q_hot, &q_cold, cajas, N_CAJA, &espera_local); }
 
-                // 3) Barra caliente: TAREA del Compañero B
+                // 3) Barra caliente
                 #pragma omp section
                 { seccion_barra_caliente(t, &rng, &q_hot, hot, N_HOT, &ventas_local, &compl_local, &espera_local); }
 
-                // 4) Barra fría: TAREA del Compañero C
+                // 4) Barra fría
                 #pragma omp section
                 { seccion_barra_fria(t, &rng, &q_cold, cold, N_COLD, &ventas_local, &compl_local, &espera_local); }
             }
@@ -221,10 +317,10 @@ int main(void){
     double throughput    = compl_tot / (R*T_MIN);                    // pedidos/min
     double tasa_abandono = (aband_tot + compl_tot)? ((double)aband_tot/(aband_tot+compl_tot)) : 0.0;
 
-    printf("prom_ventas=%.2f", prom_ventas);
-    printf("prom_espera_min=%.3f", prom_espera);
-    printf("throughput(ped/min)=%.4f", throughput);
-    printf("tasa_abandono=%.3f", tasa_abandono);
+    printf("prom_ventas=%.2f\n", prom_ventas);
+    printf("prom_espera_min=%.3f\n", prom_espera);
+    printf("throughput(ped/min)=%.4f\n", throughput);
+    printf("tasa_abandono=%.3f\n", tasa_abandono);
 
     free(lambda);
     return 0;
