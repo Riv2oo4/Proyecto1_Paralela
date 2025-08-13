@@ -5,6 +5,10 @@
 #include <math.h>
 #include <omp.h>
 
+// =======================
+// DEFINICIONES GENERALES
+// =======================
+// Si no existe M_PI en math.h, lo definimos
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -13,13 +17,13 @@
 // =======================
 // PARÁMETROS GENERALES
 // =======================
-#define T_MIN      180.0  // minutos totales de simulación
-#define DT         0.25   // tamaño del paso (minutos)
-#define R          24     // cuántas réplicas (corridas) hacemos
-#define N_CAJA     2      // cajeros
-#define N_HOT      2      // baristas calientes
-#define N_COLD     1      // baristas fríos
-#define UMBRAL_LEN 50     // si una cola supera esto, algunos se van
+#define T_MIN      180.0  // Tiempo total simulado en minutos
+#define DT         0.25   // Paso de simulación en minutos
+#define R          24     // Número de réplicas (simulaciones independientes)
+#define N_CAJA     2      // Número de cajeros
+#define N_HOT      2      // Número de baristas calientes
+#define N_COLD     1      // Número de baristas fríos
+#define UMBRAL_LEN 50     // Umbral máximo de clientes en cola antes de abandono
 
 // Tipos de producto (puedes ajustar a tu menú)
 enum Tipo { ESPRESSO=0, AMERICANO, LATTE, TEA, FRAPPE, SMOOTHIE, TIPO_COUNT };
@@ -50,7 +54,7 @@ static void llenar_lambda(double *lambda, int ticks){
 }
 
 // =======================
-// NÚMEROS ALEATORIOS
+// GENERADOR DE NÚMEROS ALEATORIOS
 // =======================
 typedef struct { uint64_t s; } RNG;         // generador sencillo
 static inline uint64_t rotl(const uint64_t x, int k){ return (x<<k)|(x>>(64-k)); }
@@ -79,7 +83,7 @@ static int poisson_knuth(double lambda, RNG *r){         // # de llegadas en un 
 }
 
 // =======================
-// ESTRUCTURAS BÁSICAS
+// ESTRUCTURAS DE DATOS
 // =======================
 typedef struct Cliente { double t_llegada; int tipo; double t_fin_caja; } Cliente;
 
@@ -89,7 +93,7 @@ typedef struct Servidor {          // representa un cajero o barista
     Cliente c;                     // a quién atiende
 } Servidor;
 
-// Cola simple con candado (suficiente para la tarea)
+// Cola circular con bloqueo
 typedef struct { Cliente *buf; int cap, head, tail, size; omp_lock_t lock; } Cola;
 static void cola_init(Cola *q, int cap){
     q->buf=(Cliente*)malloc(sizeof(Cliente)*cap); q->cap=cap; q->head=q->tail=q->size=0; omp_init_lock(&q->lock);
@@ -255,7 +259,7 @@ int main(void){
     double *lambda = (double*)malloc(sizeof(double)*TICKS);
     llenar_lambda(lambda, TICKS);
 
-    // Acumuladores globales (se suman con reduction)
+    // Variables globales con reducción
     double ventas_tot=0.0, espera_tot=0.0; int compl_tot=0, aband_tot=0;
 
     // --- Paralelismo por réplicas: cada hilo corre una simulación completa ---
