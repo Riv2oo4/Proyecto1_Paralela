@@ -113,7 +113,7 @@ static bool cola_dequeue(Cola *q, Cliente *out){
 }
 
 // =======================
-// PROTOTIPOS (para tus compas)
+// PROTOTIPOS 
 // =======================
 static void seccion_cajas(double t, RNG *rng, Cola *q_caja, Cola *q_hot, Cola *q_cold,
                           Servidor *cajas, int n_caja, double *espera_local);
