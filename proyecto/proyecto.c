@@ -59,3 +59,62 @@ static void Update() {
     }
 }
 
+static void Draw(HDC wndDC) {
+    HBRUSH bg = CreateSolidBrush(RGB(0, 0, 0));
+    FillRect(backDC, &client, bg);
+    DeleteObject(bg);
+
+    for (int i = 0; i < N; i++) {
+        HBRUSH b = CreateSolidBrush(balls[i].color);
+        HBRUSH oldB = (HBRUSH)SelectObject(backDC, b);
+        HPEN p = CreatePen(PS_SOLID, 1, balls[i].color);
+        HPEN oldP = (HPEN)SelectObject(backDC, p);
+
+        Ellipse(backDC, balls[i].x, balls[i].y, balls[i].x + 2*R, balls[i].y + 2*R);
+
+        SelectObject(backDC, oldB);
+        SelectObject(backDC, oldP);
+        DeleteObject(b);
+        DeleteObject(p);
+    }
+
+    BitBlt(wndDC, 0, 0, width, height, backDC, 0, 0, SRCCOPY);
+}
+
+LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_SIZE: {
+            width  = LOWORD(lParam);
+            height = HIWORD(lParam);
+            GetClientRect(hWnd, &client);
+            HDC hdc = GetDC(hWnd);
+            InitBackBuffer(hdc, width, height);
+            ReleaseDC(hWnd, hdc);
+        } break;
+
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hWnd, &ps);
+            Draw(hdc);
+            EndPaint(hWnd, &ps);
+        } break;
+
+        case WM_KEYDOWN:
+            if (wParam == VK_ESCAPE) { PostQuitMessage(0); running = FALSE; }
+            break;
+
+        case WM_LBUTTONDOWN:
+        case WM_RBUTTONDOWN:
+            PostQuitMessage(0); running = FALSE;
+            break;
+
+        case WM_DESTROY:
+            running = FALSE;
+            PostQuitMessage(0);
+            break;
+
+        default:
+            return DefWindowProc(hWnd, msg, wParam, lParam);
+    }
+    return 0;
+}
