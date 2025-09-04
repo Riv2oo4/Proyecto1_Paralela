@@ -1,11 +1,11 @@
-// proyecto.c — Animación de pelotas con trayectorias parabólicas (Win32/GDI, secuencial)
-// Dibuja con doble buffer, muestra FPS y gestiona partículas/sombras.
-
 #include <windows.h>
 #include <stdlib.h>
 #include <time.h>
 #include <stdio.h>
 #include <math.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #ifdef _MSC_VER
 #pragma comment(lib, "user32.lib")
@@ -72,13 +72,33 @@ static const float WALL_DAMP=0.88f;
 static double gTime=0.0;
 static HBRUSH gPortalBrush=NULL;
 
-/* Utilidades */
+/* Utilidades básicas */
 static COLORREF Darken(COLORREF c,int pct){int r=GetRValue(c),g=GetGValue(c),b=GetBValue(c);r=r*(100-pct)/100;g=g*(100-pct)/100;b=b*(100-pct)/100;return RGB(r,g,b);}
 static float GroundY(){return (float)(height-floorH);}
 static int clampi(int v,int a,int b){return v<a?a:(v>b?b:v);}
 static float clampf(float v,float a,float b){return v<a?a:(v>b?b:v);}
 
-/* Libera pinceles y memoria de bolas */
+/* RNG seguro en paralelo (usa región crítica) */
+static int rand_inclusive_safe(int lo, int hi){
+    int v;
+    #ifdef _OPENMP
+    #pragma omp critical(rng)
+    #endif
+    { v = lo + (rand() % (hi - lo + 1)); }
+    return v;
+}
+
+/* Intervalo de reaparición seguro en paralelo */
+static double NextIntervalSafe(){
+    double v;
+    #ifdef _OPENMP
+    #pragma omp critical(rng)
+    #endif
+    { v = 0.12 + (rand()%10)*0.012; }
+    return v;
+}
+
+/* Gestión de memoria y pinceles */
 static void FreeBalls(){
     if(!balls) return;
     for(int i=0;i<N;i++){ if(balls[i].brush) DeleteObject(balls[i].brush); if(balls[i].shadow) DeleteObject(balls[i].shadow); }
@@ -86,7 +106,6 @@ static void FreeBalls(){
     if(gPortalBrush){ DeleteObject(gPortalBrush); gPortalBrush=NULL; }
 }
 
-/* Crea pinceles de color y sombra para una bola */
 static void MakeBrushes(Ball* b){
     if(b->brush) DeleteObject(b->brush);
     if(b->shadow) DeleteObject(b->shadow);
@@ -94,40 +113,49 @@ static void MakeBrushes(Ball* b){
     b->shadow=CreateSolidBrush(Darken(b->color,75));
 }
 
-/* Próximo intervalo de reaparición */
 static double NextInterval(){ return 0.12 + (rand()%10)*0.012; }
 
-/* Inicializa el pool de partículas */
 static void ParticlesClear(){ for(int i=0;i<MAX_PARTICLES;i++) gParticles[i].alive=FALSE; }
 
-/* Genera chispas (efecto simple) */
+/* Emisión de partículas; protege acceso al pool con región crítica */
 static void SpawnSparks(float x,float y,int count,HBRUSH brush,float baseVx){
 #if ENABLE_SPARKS
     if(count<=0) return;
     for(int k=0;k<count;k++){
-        int idx=-1; for(int i=0;i<MAX_PARTICLES;i++){ if(!gParticles[i].alive){ idx=i; break; } }
+        int idx=-1;
+        #ifdef _OPENMP
+        #pragma omp critical(sparks)
+        #endif
+        {
+            for(int i=0;i<MAX_PARTICLES;i++){ if(!gParticles[i].alive){ idx=i; break; } }
+            if(idx>=0){
+                Particle* p=&gParticles[idx];
+                p->alive=TRUE; p->x=x; p->y=y;
+                float a=((float)(rand()%360))*(3.14159265f/180.f);
+                float sp=140.0f+(float)(rand()%160);
+                float fwd=baseVx*0.25f;
+                p->vx=cosf(a)*sp+fwd;
+                p->vy=-fabsf(sinf(a))*sp*0.95f - 60.f;
+                p->maxLife=0.28f+0.30f*((float)(rand()%100)/100.f);
+                p->life=p->maxLife;
+                p->size=2+rand()%3;
+                p->brush=brush?brush:(HBRUSH)GetStockObject(WHITE_BRUSH);
+            }
+        }
         if(idx<0) break;
-        Particle* p=&gParticles[idx];
-        p->alive=TRUE; p->x=x; p->y=y;
-        float a=((float)(rand()%360))*(3.14159265f/180.f);
-        float sp=140.0f+(float)(rand()%160);
-        float fwd=baseVx*0.25f;
-        p->vx=cosf(a)*sp+fwd;
-        p->vy=-fabsf(sinf(a))*sp*0.95f - 60.f;
-        p->maxLife=0.28f+0.30f*((float)(rand()%100)/100.f);
-        p->life=p->maxLife;
-        p->size=2+rand()%3;
-        p->brush=brush?brush:(HBRUSH)GetStockObject(WHITE_BRUSH);
     }
 #else
     (void)x;(void)y;(void)count;(void)brush;(void)baseVx;
 #endif
 }
 
-/* Actualiza partículas (gravedad, amortiguamiento, rebote suelo) */
+/* Actualización de partículas en paralelo; dibujo sigue secuencial */
 static void ParticlesUpdate(double dt){
 #if ENABLE_SPARKS
     float gy=GroundY();
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for(int i=0;i<MAX_PARTICLES;i++){
         Particle* p=&gParticles[i];
         if(!p->alive) continue;
@@ -143,7 +171,6 @@ static void ParticlesUpdate(double dt){
 #endif
 }
 
-/* Dibuja partículas */
 static void ParticlesDraw(){
 #if ENABLE_SPARKS
     HPEN oldPen=(HPEN)SelectObject(backDC,GetStockObject(NULL_PEN));
@@ -163,7 +190,7 @@ static void ParticlesDraw(){
 #endif
 }
 
-/* Inicializa una bola nueva (posición, velocidades, color, pinceles) */
+/* Activación de bola (genera estado inicial y pinceles) */
 static void ActivateBall(Ball* b){
     int r=MIN_R+rand()%(MAX_R-MIN_R+1);
     b->r=r;
@@ -187,8 +214,8 @@ static void ActivateBall(Ball* b){
 #endif
 }
 
-/* Desactiva y programa reaparición */
-static void ScheduleBall(Ball* b){
+/* Desactiva y reprograma la bola (serial) */
+static void ScheduleBallSerial(Ball* b){
     if(gPortalBrush){
         float cy=b->y+b->r;
         BOOL onFloor=fabsf(cy-GroundY())<2.0f;
@@ -198,7 +225,18 @@ static void ScheduleBall(Ball* b){
     b->spawnAt=gTime+NextInterval();
 }
 
-/* Reserva arreglo de bolas y configura spawn escalonado */
+/* Desactiva y reprograma la bola (seguro en paralelo) */
+static void ScheduleBallSafe(Ball* b, float gy){
+    if(gPortalBrush){
+        float cy=b->y+b->r;
+        BOOL onFloor=fabsf(cy-gy)<2.0f;
+        if(onFloor) SpawnSparks(b->x+b->r,gy,18,gPortalBrush,b->vx);
+    }
+    b->active=FALSE;
+    b->spawnAt=gTime + NextIntervalSafe();
+}
+
+/* Inicializa arreglo de bolas y partículas */
 static void InitBalls(){
     FreeBalls();
     balls=(Ball*)calloc(N,sizeof(Ball));
@@ -214,7 +252,7 @@ static void InitBalls(){
     ParticlesClear();
 }
 
-/* Crea backbuffer compatible con la ventana */
+/* Backbuffer para dibujo sin flicker */
 static void InitBackBuffer(HDC wndDC,int w,int h){
     if(backDC){ SelectObject(backDC,backOld); DeleteObject(backBMP); DeleteDC(backDC); backDC=NULL; backBMP=NULL; backOld=NULL; }
     backDC=CreateCompatibleDC(wndDC);
@@ -222,7 +260,7 @@ static void InitBackBuffer(HDC wndDC,int w,int h){
     backOld=(HBITMAP)SelectObject(backDC,backBMP);
 }
 
-/* Fondo con gradiente y piso */
+/* Fondo y “piso” */
 static void DrawBackground(){
     TRIVERTEX v[4];
     v[0].x=0; v[0].y=0; v[0].Red=0x0015; v[0].Green=0x0015; v[0].Blue=0x0024; v[0].Alpha=0;
@@ -276,7 +314,7 @@ static void DrawBallWithEffects(Ball* b){
     SelectObject(backDC,oldBrush);
 }
 
-/* Dibuja estela atenuada */
+/* Estela simple */
 static void DrawTrails(Ball* b){
 #if ENABLE_TRAILS
     HBRUSH oldBrush=(HBRUSH)SelectObject(backDC,b->shadow);
@@ -310,7 +348,7 @@ static void DrawBalls(int* outActive){
     if(outActive) *outActive=active;
 }
 
-/* HUD de FPS y conteo de bolas activas */
+/* HUD de FPS y conteo */
 static void DrawHUD(double fps,int active){
     SetBkMode(backDC,TRANSPARENT);
     SetTextColor(backDC,RGB(240,240,240));
@@ -319,16 +357,19 @@ static void DrawHUD(double fps,int active){
     TextOutA(backDC,8,8,buf,lstrlenA(buf));
 }
 
-/* Presenta el backbuffer en la ventana */
+/* Presenta el backbuffer */
 static void Present(HDC wndDC){ BitBlt(wndDC,0,0,width,height,backDC,0,0,SRCCOPY); }
 
-/* Física: activa bolas pendientes y actualiza dinámica con rebotes/rozamientos */
+/* Física: activa bolas (serial) y actualiza en paralelo; partículas también en paralelo */
 static void UpdatePhysics(double dt){
     dt*=TIME_SCALE;
     float gy=GroundY();
 
     for(int i=0;i<N;i++){ if(!balls[i].active && gTime>=balls[i].spawnAt) ActivateBall(&balls[i]); }
 
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for(int i=0;i<N;i++){
         Ball* b=&balls[i];
         if(!b->active) continue;
@@ -336,10 +377,8 @@ static void UpdatePhysics(double dt){
         int r=b->r;
         float prevVy=b->vy;
 
-        float wind = 70.0f*sinf((float)(1.10*gTime + b->phase)) + 35.0f*sinf((float)(0.63*gTime + i*0.19));
+        float wind = 70.0f*sinf((float)(1.10*gTime + b->phase)) + 35.0f*sinf((float)(0.63*gTime + i*0.19f));
         b->vx += wind*(float)dt;
-
-        float speed=fabsf(b->vx)+fabsf(b->vy); (void)speed;
 
         float lift = b->liftCoeff * b->angVel * b->vx;
         b->vy += (G + lift)*(float)dt;
@@ -356,17 +395,19 @@ static void UpdatePhysics(double dt){
             b->vx*=GROUND_FRICTION;
             if(fabsf(b->vy)<60.f) b->vy=0.f;
 
-            float squashAmt=clampf(1.0f + impact/850.0f,1.0f,1.95f);
-            b->squash=squashAmt;
-
+            b->squash=clampf(1.0f + impact/850.0f,1.0f,1.95f);
             b->angVel += (b->vx/(float)(r))*0.35f;
 
             if(impact>300.f){
                 int cnt=8+(int)(impact/220.f); if(cnt>28) cnt=28;
                 SpawnSparks(b->x+r,gy,cnt,b->shadow,b->vx);
             }
-            if(fabsf(b->vx)>420.f && fabsf(b->vy)<30.f && (rand()%4==0)){
-                b->vy -= 420.f + (rand()%180);
+            {
+                int toss = rand_inclusive_safe(0,3);
+                if(fabsf(b->vx)>420.f && fabsf(b->vy)<30.f && (toss==0)){
+                    float extra = 420.f + (float)rand_inclusive_safe(0,179);
+                    b->vy -= extra;
+                }
             }
         }
 
@@ -388,15 +429,20 @@ static void UpdatePhysics(double dt){
         b->jitterT += (float)dt;
         if(b->jitterT>0.08f){
             b->jitterT=0.f;
-            b->vx += (float)((rand()%200)-100)*0.6f;
-            if(rand()%6==0) b->angVel += ((float)((rand()%200)-100)/100.f)*0.9f;
+            int dx = rand_inclusive_safe(-100,100);
+            b->vx += (float)dx * 0.6f;
+            int r6 = rand_inclusive_safe(0,5);
+            if(r6==0){
+                int da = rand_inclusive_safe(-100,100);
+                b->angVel += ((float)da/100.f)*0.9f;
+            }
         }
 
         BOOL onFloor=fabsf((b->y+r)-gy)<1.0f;
         BOOL nearRight=(b->x + 2*r)>(RIGHT_ZONE*width);
         BOOL quiet=fabsf(b->vx)<QUIET_VX && fabsf(b->vy)<QUIET_VY;
-        if(onFloor && nearRight && quiet){ ScheduleBall(b); continue; }
-        if(b->x - 2*r > width+20){ ScheduleBall(b); continue; }
+        if(onFloor && nearRight && quiet){ ScheduleBallSafe(b, gy); continue; }
+        if(b->x - 2*r > width+20){ ScheduleBallSafe(b, gy); continue; }
 
 #if ENABLE_TRAILS
         for(int k=TRAIL_LEN-1;k>0;k--){ b->trailX[k]=b->trailX[k-1]; b->trailY[k]=b->trailY[k-1]; }
@@ -407,7 +453,7 @@ static void UpdatePhysics(double dt){
     ParticlesUpdate(dt);
 }
 
-/* Redimensiona y recrea backbuffer al cambiar tamaño */
+/* Redimensiona y recrea backbuffer */
 static void ResizeRecreate(){
     GetClientRect(hwnd,&client);
     width=client.right-client.left; height=client.bottom-client.top;
@@ -415,7 +461,7 @@ static void ResizeRecreate(){
     HDC wndDC=GetDC(hwnd); InitBackBuffer(wndDC,width,height); ReleaseDC(hwnd,wndDC);
 }
 
-/* Ventana Win32: repinta, resize y cierre */
+/* Ventana Win32 estándar */
 static LRESULT CALLBACK WndProc(HWND h,UINT msg,WPARAM wParam,LPARAM lParam){
     switch(msg){
         case WM_SIZE: ResizeRecreate(); return 0;
@@ -425,7 +471,7 @@ static LRESULT CALLBACK WndProc(HWND h,UINT msg,WPARAM wParam,LPARAM lParam){
     return DefWindowProc(h,msg,wParam,lParam);
 }
 
-/* Lee N desde línea de comandos (opcional) */
+/* Lee N desde la línea de comandos */
 static int ParseN(LPSTR lpCmdLine){
     if(!lpCmdLine||!*lpCmdLine) return DEF_N;
     char* endp=NULL; long v=strtol(lpCmdLine,&endp,10);
@@ -434,18 +480,20 @@ static int ParseN(LPSTR lpCmdLine){
     return (int)v;
 }
 
-/* Programa principal: bucle de mensajes + render + HUD */
+/* Programa principal */
 int WINAPI WinMain(HINSTANCE hInst,HINSTANCE hPrev,LPSTR lpCmd,int nShow){
     (void)hPrev;
-    const char* CLASS_NAME="SequentialEmitterWnd";
+    const char* CLASS_NAME="SequentialEmitterWnd_OMP";
     WNDCLASSA wc={0};
     wc.lpfnWndProc=WndProc; wc.hInstance=hInst; wc.hCursor=LoadCursor(NULL,IDC_ARROW);
     wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1); wc.lpszClassName=CLASS_NAME;
     if(!RegisterClassA(&wc)) return 0;
+
     int initW=960, initH=560;
-    hwnd=CreateWindowA(CLASS_NAME,"Left-to-Right Parabolic Bounces (FX++)",
+    hwnd=CreateWindowA(CLASS_NAME,"Left-to-Right Parabolic Bounces (OMP)",
                        WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,CW_USEDEFAULT,initW,initH,NULL,NULL,hInst,NULL);
     if(!hwnd) return 0;
+
     ShowWindow(hwnd,nShow); UpdateWindow(hwnd);
     ResizeRecreate();
     N=ParseN(lpCmd);
@@ -457,7 +505,10 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE hPrev,LPSTR lpCmd,int nShow){
 
     MSG msg; DWORD nextFrame=GetTickCount();
     while(running){
-        while(PeekMessage(&msg,NULL,0,0,PM_REMOVE)){ if(msg.message==WM_QUIT) running=FALSE; TranslateMessage(&msg); DispatchMessage(&msg); }
+        while(PeekMessage(&msg,NULL,0,0,PM_REMOVE)){
+            if(msg.message==WM_QUIT) running=FALSE;
+            TranslateMessage(&msg); DispatchMessage(&msg);
+        }
         if(!running) break;
 
         LARGE_INTEGER now; QueryPerformanceCounter(&now);
@@ -469,11 +520,16 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE hPrev,LPSTR lpCmd,int nShow){
         int active=0; DrawBalls(&active);
         ParticlesDraw();
         DrawHUD(fps,active);
+
         HDC wndDC=GetDC(hwnd); Present(wndDC); ReleaseDC(hwnd,wndDC);
 
-        fps_acc+=dt; fps_frames++; if(fps_acc>=0.25){ fps=(double)fps_frames/fps_acc; fps_acc=0.0; fps_frames=0; }
-        nextFrame+=FRAME_MS; DWORD t=GetTickCount(); if(nextFrame>t) Sleep(nextFrame-t); else nextFrame=t;
+        fps_acc+=dt; fps_frames++;
+        if(fps_acc>=0.25){ fps=(double)fps_frames/fps_acc; fps_acc=0.0; fps_frames=0; }
+
+        nextFrame+=FRAME_MS; DWORD t=GetTickCount();
+        if(nextFrame>t) Sleep(nextFrame-t); else nextFrame=t;
     }
+
     FreeBalls();
     if(backDC){ SelectObject(backDC,backOld); DeleteObject(backBMP); DeleteDC(backDC); }
     return 0;
