@@ -148,3 +148,128 @@ static void SpawnSparks(float x,float y,int count,HBRUSH brush,float baseVx){
     (void)x;(void)y;(void)count;(void)brush;(void)baseVx;
 #endif
 }
+/* Actualización de partículas en paralelo; dibujo sigue secuencial */
+static void ParticlesUpdate(double dt){
+#if ENABLE_SPARKS
+    float gy=GroundY();
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for(int i=0;i<MAX_PARTICLES;i++){
+        Particle* p=&gParticles[i];
+        if(!p->alive) continue;
+        p->life-=(float)dt; if(p->life<=0.f){ p->alive=FALSE; continue; }
+        p->vy+=G*0.35f*(float)dt;
+        p->vx*=(1.0f-0.035f*(float)dt);
+        p->x+=p->vx*(float)dt;
+        p->y+=p->vy*(float)dt;
+        if(p->y>gy){ p->y=gy; p->vy=-p->vy*0.30f; p->vx*=0.84f; if(fabsf(p->vy)<16.f) p->vy=0; }
+    }
+#else
+    (void)dt;
+#endif
+}
+
+static void ParticlesDraw(){
+#if ENABLE_SPARKS
+    HPEN oldPen=(HPEN)SelectObject(backDC,GetStockObject(NULL_PEN));
+    HBRUSH oldBrush=NULL;
+    for(int i=0;i<MAX_PARTICLES;i++){
+        Particle* p=&gParticles[i];
+        if(!p->alive) continue;
+        int s=p->size;
+        float t=p->life/(p->maxLife+1e-6f);
+        s=(int)(s*clampf(0.5f+t,0.5f,1.0f)); if(s<=0) s=1;
+        int x=(int)p->x - s/2, y=(int)p->y - s/2;
+        oldBrush=(HBRUSH)SelectObject(backDC,p->brush);
+        Ellipse(backDC,x,y,x+s,y+s);
+    }
+    if(oldBrush) SelectObject(backDC,oldBrush);
+    SelectObject(backDC,oldPen);
+#endif
+}
+
+/* Activación de bola (genera estado inicial y pinceles) */
+static void ActivateBall(Ball* b){
+    int r=MIN_R+rand()%(MAX_R-MIN_R+1);
+    b->r=r;
+    b->x=(float)(-2*r - (rand()%60));
+    float startY=GroundY()-(float)(height*0.48f + rand()%(height/7));
+    if(startY<0) startY=0;
+    b->y=startY - r;
+    b->vx=350.0f + (float)(rand()%210);
+    b->vy=-(640.0f + (float)(rand()%360));
+    b->color=RGB(rand()%200+40,rand()%200+40,rand()%200+40);
+    MakeBrushes(b);
+    b->active=TRUE;
+    b->angle=(float)((rand()%360)*3.14159265/180.0);
+    b->angVel=0.0f;
+    b->squash=1.0f;
+    b->phase=(float)((rand()%628)/100.0f);
+    b->liftCoeff=0.00055f + 0.00035f*((float)(rand()%100)/100.f);
+    b->jitterT=(float)(rand()%1000)/1000.f;
+#if ENABLE_TRAILS
+    b->trailCount=0; for(int j=0;j<TRAIL_LEN;j++){ b->trailX[j]=b->x+b->r; b->trailY[j]=b->y+b->r; }
+#endif
+}
+
+/* Desactiva y reprograma la bola (serial) */
+static void ScheduleBallSerial(Ball* b){
+    if(gPortalBrush){
+        float cy=b->y+b->r;
+        BOOL onFloor=fabsf(cy-GroundY())<2.0f;
+        if(onFloor) SpawnSparks(b->x+b->r,GroundY(),18,gPortalBrush,b->vx);
+    }
+    b->active=FALSE;
+    b->spawnAt=gTime+NextInterval();
+}
+
+/* Desactiva y reprograma la bola (seguro en paralelo) */
+static void ScheduleBallSafe(Ball* b, float gy){
+    if(gPortalBrush){
+        float cy=b->y+b->r;
+        BOOL onFloor=fabsf(cy-gy)<2.0f;
+        if(onFloor) SpawnSparks(b->x+b->r,gy,18,gPortalBrush,b->vx);
+    }
+    b->active=FALSE;
+    b->spawnAt=gTime + NextIntervalSafe();
+}
+
+/* Inicializa arreglo de bolas y partículas */
+static void InitBalls(){
+    FreeBalls();
+    balls=(Ball*)calloc(N,sizeof(Ball));
+    srand((unsigned)time(NULL));
+    if(!gPortalBrush) gPortalBrush=CreateSolidBrush(RGB(120,160,255));
+    double t=0.0;
+    for(int i=0;i<N;i++){
+        balls[i].active=FALSE;
+        balls[i].spawnAt=t;
+        balls[i].squash=1.0f;
+        t+=0.09 + (rand()%10)*0.008;
+    }
+    ParticlesClear();
+}
+
+/* Backbuffer para dibujo sin flicker */
+static void InitBackBuffer(HDC wndDC,int w,int h){
+    if(backDC){ SelectObject(backDC,backOld); DeleteObject(backBMP); DeleteDC(backDC); backDC=NULL; backBMP=NULL; backOld=NULL; }
+    backDC=CreateCompatibleDC(wndDC);
+    backBMP=CreateCompatibleBitmap(wndDC,w,h);
+    backOld=(HBITMAP)SelectObject(backDC,backBMP);
+}
+
+/* Fondo y “piso” */
+static void DrawBackground(){
+    TRIVERTEX v[4];
+    v[0].x=0; v[0].y=0; v[0].Red=0x0015; v[0].Green=0x0015; v[0].Blue=0x0024; v[0].Alpha=0;
+    v[1].x=width; v[1].y=0; v[1].Red=0x0024; v[1].Green=0x0024; v[1].Blue=0x0040; v[1].Alpha=0;
+    v[2].x=0; v[2].y=height; v[2].Red=0x0010; v[2].Green=0x0010; v[2].Blue=0x0020; v[2].Alpha=0;
+    v[3].x=width; v[3].y=height; v[3].Red=0x0030; v[3].Green=0x0030; v[3].Blue=0x004A; v[3].Alpha=0;
+    GRADIENT_TRIANGLE g[2]={{0,1,2},{1,3,2}};
+    GradientFill(backDC,v,4,g,2,GRADIENT_FILL_TRIANGLE);
+    RECT floor={0,height-floorH,width,height};
+    HBRUSH ground=CreateSolidBrush(RGB(18,18,22));
+    FillRect(backDC,&floor,ground);
+    DeleteObject(ground);
+}
