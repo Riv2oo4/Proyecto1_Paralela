@@ -88,3 +88,63 @@ static int rand_inclusive_safe(int lo, int hi){
     return v;
 }
 
+/* Intervalo de reaparición seguro en paralelo */
+static double NextIntervalSafe(){
+    double v;
+    #ifdef _OPENMP
+    #pragma omp critical(rng)
+    #endif
+    { v = 0.12 + (rand()%10)*0.012; }
+    return v;
+}
+
+/* Gestión de memoria y pinceles */
+static void FreeBalls(){
+    if(!balls) return;
+    for(int i=0;i<N;i++){ if(balls[i].brush) DeleteObject(balls[i].brush); if(balls[i].shadow) DeleteObject(balls[i].shadow); }
+    free(balls); balls=NULL;
+    if(gPortalBrush){ DeleteObject(gPortalBrush); gPortalBrush=NULL; }
+}
+
+static void MakeBrushes(Ball* b){
+    if(b->brush) DeleteObject(b->brush);
+    if(b->shadow) DeleteObject(b->shadow);
+    b->brush=CreateSolidBrush(b->color);
+    b->shadow=CreateSolidBrush(Darken(b->color,75));
+}
+
+static double NextInterval(){ return 0.12 + (rand()%10)*0.012; }
+
+static void ParticlesClear(){ for(int i=0;i<MAX_PARTICLES;i++) gParticles[i].alive=FALSE; }
+
+/* Emisión de partículas; protege acceso al pool con región crítica */
+static void SpawnSparks(float x,float y,int count,HBRUSH brush,float baseVx){
+#if ENABLE_SPARKS
+    if(count<=0) return;
+    for(int k=0;k<count;k++){
+        int idx=-1;
+        #ifdef _OPENMP
+        #pragma omp critical(sparks)
+        #endif
+        {
+            for(int i=0;i<MAX_PARTICLES;i++){ if(!gParticles[i].alive){ idx=i; break; } }
+            if(idx>=0){
+                Particle* p=&gParticles[idx];
+                p->alive=TRUE; p->x=x; p->y=y;
+                float a=((float)(rand()%360))*(3.14159265f/180.f);
+                float sp=140.0f+(float)(rand()%160);
+                float fwd=baseVx*0.25f;
+                p->vx=cosf(a)*sp+fwd;
+                p->vy=-fabsf(sinf(a))*sp*0.95f - 60.f;
+                p->maxLife=0.28f+0.30f*((float)(rand()%100)/100.f);
+                p->life=p->maxLife;
+                p->size=2+rand()%3;
+                p->brush=brush?brush:(HBRUSH)GetStockObject(WHITE_BRUSH);
+            }
+        }
+        if(idx<0) break;
+    }
+#else
+    (void)x;(void)y;(void)count;(void)brush;(void)baseVx;
+#endif
+}
