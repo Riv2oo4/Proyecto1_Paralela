@@ -23,3 +23,31 @@
 #define TRAIL_LEN 10
 #define ENABLE_SPARKS 1
 #define MAX_PARTICLES 1800
+
+typedef struct {
+    float x,y;
+    float vx,vy;
+    int r;
+    COLORREF color;
+    HBRUSH brush;
+    HBRUSH shadow;
+    BOOL active;
+    double spawnAt;
+    float angle;
+    float angVel;
+    float squash;
+    float phase;
+    float liftCoeff;
+    float jitterT;
+#if ENABLE_TRAILS
+    float trailX[TRAIL_LEN], trailY[TRAIL_LEN];
+    int trailCount;
+#endif
+} Ball;
+
+typedef struct {
+    BOOL alive;
+    float x,y,vx,vy,life,maxLife;
+    int size;
+    HBRUSH brush;
+} Particle;
